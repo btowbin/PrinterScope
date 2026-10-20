@@ -63,3 +63,65 @@ def load_points(path: Path) -> list[StagePoint]:
     data = json.loads(path.read_text(encoding="utf-8"))
     return [StagePoint(**item) for item in data]
 
+
+
+UPDATE_MODES = ("point_xyz", "point_xy", "point_z", "all_xyz", "all_xy", "all_z")
+
+
+def update_points(points: list[StagePoint], index: int, current: Position,
+                  mode: str) -> list[StagePoint]:
+    """Return a new point list after re-teaching or shifting positions.
+
+    ``point_*`` modes copy the chosen axes of ``current`` onto points[index].
+    ``all_*`` modes compute the shift between ``current`` and the stored
+    points[index] and apply the same shift to every point on the chosen axes.
+    """
+    if mode not in UPDATE_MODES:
+        raise ValueError(f"Unknown update mode: {mode}")
+    if not 0 <= index < len(points):
+        raise IndexError("No position selected")
+    scope, axes = mode.split("_", 1)
+    use_xy, use_z = "xy" in axes, axes.endswith("z")
+    reference = points[index]
+    dx, dy, dz = (current.x - reference.x, current.y - reference.y,
+                  current.z - reference.z)
+    result: list[StagePoint] = []
+    for i, p in enumerate(points):
+        if scope == "point" and i != index:
+            result.append(StagePoint(p.name, p.x, p.y, p.z))
+            continue
+        result.append(StagePoint(
+            p.name,
+            p.x + dx if use_xy else p.x,
+            p.y + dy if use_xy else p.y,
+            p.z + dz if use_z else p.z,
+        ))
+    return result
+
+
+class PointsHistory:
+    """Undo history for the positions list: snapshots taken *before* each change."""
+
+    def __init__(self, limit: int = 100) -> None:
+        self.limit = limit
+        self._stack: list[tuple[str, list[StagePoint]]] = []
+
+    def record(self, label: str, points: list[StagePoint]) -> None:
+        self._stack.append((label, [StagePoint(p.name, p.x, p.y, p.z) for p in points]))
+        del self._stack[:-self.limit]
+
+    def can_undo(self) -> bool:
+        return bool(self._stack)
+
+    def next_label(self) -> str | None:
+        return self._stack[-1][0] if self._stack else None
+
+    def undo(self) -> tuple[str, list[StagePoint]]:
+        """Pop the latest snapshot: (what was undone, the list as it was before)."""
+        if not self._stack:
+            raise IndexError("Nothing to undo")
+        return self._stack.pop()
+
+    def clear(self) -> None:
+        self._stack.clear()
+

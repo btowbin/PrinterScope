@@ -53,6 +53,13 @@ def load_gxipy():
 
 class Camera(ABC):
     is_connected: bool = False
+    bit_depth: int = 10
+
+    def set_bit_depth(self, bits: int) -> None:
+        """Select the sensor/pixel bit depth (10 or 14); raise if unsupported."""
+        if bits not in (10, 14):
+            raise ValueError("Bit depth must be 10 or 14")
+        self.bit_depth = bits
 
     @abstractmethod
     def connect(self) -> None: ...
@@ -67,7 +74,8 @@ class Camera(ABC):
 class SimulatedCamera(Camera):
     """Synthetic 10-bit camera; focus depends on the supplied Z callback."""
 
-    def __init__(self, z_provider=lambda: 5.0, focus_z: float = 5.0):
+    def __init__(self, z_provider=lambda: 5.0, focus_z: float = 5.0, bit_depth: int = 10):
+        self.bit_depth = bit_depth
         self.z_provider = z_provider
         self.focus_z = focus_z
         self.is_connected = False
@@ -91,15 +99,17 @@ class SimulatedCamera(Camera):
             self._checker_mask = ((xx // 48) + (yy // 48)) % 2 == 1
         defocus = abs(self.z_provider() - self.focus_z)
         contrast = max(0.03, float(np.exp(-((defocus / 0.18) ** 2))))
-        image = np.full((height, width), 220, dtype=np.uint16)
-        image[self._checker_mask] = np.uint16(220 + round(520 * contrast))
+        scale = ((1 << self.bit_depth) - 1) / 1023.0
+        image = np.full((height, width), round(220 * scale), dtype=np.uint16)
+        image[self._checker_mask] = np.uint16(round((220 + 520 * contrast) * scale))
         return image
 
 
 class DahengCamera(Camera):
     """Daheng MER/IMX178 adapter using the Galaxy SDK gxipy module."""
 
-    def __init__(self, device_index: int = 1):
+    def __init__(self, device_index: int = 1, bit_depth: int = 10):
+        self.bit_depth = bit_depth
         self.device_index = device_index
         self.device_manager = None
         self.device = None
@@ -116,15 +126,11 @@ class DahengCamera(Camera):
             raise RuntimeError("No Daheng camera was detected")
         self.device = self.device_manager.open_device_by_index(self.device_index)
         try:
-            self.device.PixelFormat.set(gx.GxPixelFormatEntry.MONO10)
+            self._apply_pixel_format(self.bit_depth)
         except Exception:
-            # Some IMX178 models expose Mono10Packed rather than Mono10.
-            try:
-                self.device.PixelFormat.set(gx.GxPixelFormatEntry.MONO10_PACKED)
-            except Exception as exc:
-                self.device.close_device()
-                self.device = None
-                raise RuntimeError("Camera does not expose a supported 10-bit mono format") from exc
+            self.device.close_device()
+            self.device = None
+            raise
         try:
             self.device.TriggerMode.set(gx.GxSwitchEntry.ON)
             self.device.TriggerSource.set(gx.GxTriggerSourceEntry.SOFTWARE)
@@ -157,6 +163,43 @@ class DahengCamera(Camera):
         except Exception:
             pass
         self.is_connected = True
+
+    def _apply_pixel_format(self, bits: int) -> None:
+        gx = self._gx
+        entries = {10: ("MONO10", "MONO10_PACKED"), 14: ("MONO14", "MONO14_PACKED")}
+        if bits not in entries:
+            raise ValueError("Bit depth must be 10 or 14")
+        last_error: Exception | None = None
+        for entry_name in entries[bits]:
+            entry = getattr(gx.GxPixelFormatEntry, entry_name, None)
+            if entry is None:
+                continue
+            try:
+                self.device.PixelFormat.set(entry)
+                return
+            except Exception as exc:  # unsupported by this camera model
+                last_error = exc
+        raise RuntimeError(
+            f"This camera does not expose a {bits}-bit mono pixel format"
+            + (f" ({last_error})" if last_error else "")
+        )
+
+    def set_bit_depth(self, bits: int) -> None:
+        if bits not in (10, 14):
+            raise ValueError("Bit depth must be 10 or 14")
+        if self.device is None:
+            self.bit_depth = bits
+            return
+        previous = self.bit_depth
+        try:
+            self._apply_pixel_format(bits)
+        except Exception:
+            try:  # restore the format that was working
+                self._apply_pixel_format(previous)
+            except Exception:
+                pass
+            raise
+        self.bit_depth = bits
 
     def disconnect(self) -> None:
         if self.device is not None:
@@ -205,8 +248,9 @@ class DahengCamera(Camera):
 
         if result is None:
             raise RuntimeError("Camera acquisition ended without an image")
-        # Packed/unpacked SDK paths can differ; guarantee a 10-bit value range.
-        if result.max(initial=0) > 1023:
-            result = result >> max(0, int(result.max()).bit_length() - 10)
-        return np.clip(result, 0, 1023).astype(np.uint16, copy=False)
+        # Packed/unpacked SDK paths can differ; guarantee the selected value range.
+        limit = (1 << self.bit_depth) - 1
+        if result.max(initial=0) > limit:
+            result = result >> max(0, int(result.max()).bit_length() - self.bit_depth)
+        return np.clip(result, 0, limit).astype(np.uint16, copy=False)
 
