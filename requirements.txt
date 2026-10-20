@@ -1,0 +1,6 @@
+# Galaxy SDK's bundled gxipy still imports numpy.compat, removed in NumPy 2.x.
+numpy>=1.26,<2
+Pillow>=10.0
+pyserial>=3.5
+tifffile>=2024.2.12
+
